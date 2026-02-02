@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>多人大乱斗</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <style>
+        body { margin: 0; background: #111; color: white; overflow: hidden; font-family: sans-serif; }
+        canvas { display: block; background: #222; }
+        
+        /* UI */
+        #login-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.9); display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 99; }
+        #login-box { background: #333; padding: 20px; border-radius: 8px; text-align: center; border: 1px solid #555; }
+        input { padding: 10px; margin: 10px 0; border-radius: 4px; border: none; text-align: center; }
+        button { padding: 10px 20px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; }
+        
+        #ui-layer { position: absolute; inset: 0; pointer-events: none; display: none; }
+        #scoreboard { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 4px; }
+        #kill-feed { position: absolute; top: 10px; right: 10px; text-align: right; }
+        .feed-item { background: rgba(0,0,0,0.6); padding: 4px 8px; margin-bottom: 4px; border-radius: 4px; font-size: 12px; animation: fade 3s forwards; }
+        @keyframes fade { to { opacity: 0; transform: translateX(20px); } }
+    </style>
+</head>
+<body>
+
+    <div id="login-overlay">
+        <div id="login-box">
+            <h2>加入战场</h2>
+            <input type="text" id="name-input" placeholder="输入名字" maxlength="8">
+            <br>
+            <button id="start-btn">开始游戏</button>
+        </div>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <div id="ui-layer">
+        <div id="scoreboard"><div id="score-list"></div></div>
+        <div id="kill-feed"></div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        // 全屏
+        function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+        window.addEventListener('resize', resize);
+        resize();
+
+        // 游戏变量
+        let gameState = { players: {}, bullets: [] };
+        let obstacles = [];
+        let mapSize = { w: 2000, h: 2000 };
+        let myId = null;
+        let isPlaying = false;
+        let camera = { x: 0, y: 0 };
+        
+        // 按键状态
+        const keys = { w: false, a: false, s: false, d: false };
+
+        // === 1. 登录逻辑 ===
+        const loginDiv = document.getElementById('login-overlay');
+        const uiDiv = document.getElementById('ui-layer');
+        const input = document.getElementById('name-input');
+        const btn = document.getElementById('start-btn');
+
+        function startGame() {
+            const name = input.value.trim();
+            if (name) {
+                socket.emit('joinGame', name);
+                btn.innerText = "连接中...";
+            }
+        }
+        btn.onclick = startGame;
+        input.onkeydown = (e) => { if (e.key === 'Enter') startGame(); };
+
+        socket.on('connect', () => { myId = socket.id; });
+        
+        socket.on('mapData', (data) => {
+            console.log("地图加载成功"); 
+            obstacles = data.obstacles || [];
+            mapSize = { w: data.width, h: data.height };
+        });
+
+        socket.on('joinSuccess', () => {
+            console.log("加入成功");
+            isPlaying = true;
+            loginDiv.style.display = 'none';
+            uiDiv.style.display = 'block';
+        });
+
+        // === 2. 网络同步 (含插值准备) ===
+        socket.on('gameState', (serverState) => {
+            gameState.bullets = serverState.bullets;
+
+            Object.keys(serverState.players).forEach(id => {
+                const sPlayer = serverState.players[id];
+                
+                if (!gameState.players[id]) {
+                    // 新玩家：直接初始化
+                    gameState.players[id] = sPlayer;
+                    gameState.players[id].renderX = sPlayer.x;
+                    gameState.players[id].renderY = sPlayer.y;
+                } else {
+                    // 已存在玩家：更新数据
+                    const localP = gameState.players[id];
+                    // 同步基础属性
+                    localP.hp = sPlayer.hp;
+                    localP.maxHp = sPlayer.maxHp;
+                    localP.score = sPlayer.score;
+                    localP.weapon = sPlayer.weapon;
+                    localP.name = sPlayer.name;
+                    localP.color = sPlayer.color;
+
+                    if (id === myId) {
+                        // 自己：只做位置校验 (防瞬移)
+                        const dist = Math.hypot(localP.x - sPlayer.x, localP.y - sPlayer.y);
+                        if (dist > 50) { // 误差太大才拉回
+                            localP.x = sPlayer.x;
+                            localP.y = sPlayer.y;
+                        }
+                        localP.renderX = localP.x;
+                        localP.renderY = localP.y;
+                    } else {
+                        // 别人：设定目标位置，用于插值
+                        localP.targetX = sPlayer.x;
+                        localP.targetY = sPlayer.y;
+                    }
+                }
+            });
+
+            // 移除离线玩家
+            for(let id in gameState.players) {
+                if(!serverState.players[id]) delete gameState.players[id];
+            }
+            updateScoreboard();
+        });
+
+        socket.on('killFeed', (d) => {
+            const el = document.createElement('div');
+            el.className = 'feed-item';
+            el.innerHTML = `<b style="color:#ffeb3b">${d.killer}</b> [${d.weapon}] <b>${d.victim}</b>`;
+            document.getElementById('kill-feed').append(el);
+            setTimeout(() => el.remove(), 3000);
+        });
+
+        // === 3. 输入监听 (修复版) ===
+        window.addEventListener('keydown', (e) => {
+            // 转小写，防止大写锁定导致 WASD 失效
+            const k = e.key.toLowerCase();
+            if (keys.hasOwnProperty(k)) keys[k] = true;
+            
+            if (k === '1') socket.emit('switchWeapon', 'pistol');
+            if (k === '2') socket.emit('switchWeapon', 'shotgun');
+            if (k === '3') socket.emit('switchWeapon', 'machinegun');
+        });
+
+        window.addEventListener('keyup', (e) => {
+            const k = e.key.toLowerCase();
+            if (keys.hasOwnProperty(k)) keys[k] = false;
+        });
+
+        canvas.addEventListener('mousedown', (e) => {
+            if (!isPlaying || !gameState.players[myId]) return;
+            const p = gameState.players[myId];
+            const wx = e.clientX + camera.x;
+            const wy = e.clientY + camera.y;
+            const angle = Math.atan2(wy - (p.y + 20), wx - (p.x + 20));
+            socket.emit('shoot', angle);
+        });
+
+        // === 4. 物理循环 (客户端预测) ===
+        setInterval(() => {
+            if (!isPlaying || !gameState.players[myId]) return;
+            
+            const p = gameState.players[myId];
+            const speed = 5;
+            let dx = 0, dy = 0;
+
+            if (keys.w) dy -= speed;
+            if (keys.s) dy += speed;
+            if (keys.a) dx -= speed;
+            if (keys.d) dx += speed;
+
+            if (dx !== 0 || dy !== 0) {
+                const nx = p.x + dx;
+                const ny = p.y + dy;
+                
+                // 本地碰撞检测
+                let col = false;
+                // 边界
+                if (nx < 0 || nx > mapSize.w - 40 || ny < 0 || ny > mapSize.h - 40) col = true;
+                // 障碍物 (增加安全检查)
+                if (!col && obstacles && obstacles.length > 0) {
+                    for (const w of obstacles) {
+                        if (nx < w.x + w.w && nx + 40 > w.x && ny < w.y + w.h && ny + 40 > w.y) {
+                            col = true; break;
+                        }
+                    }
+                }
+
+                if (!col) {
+                    // 没撞墙：立即移动并发送
+                    p.x = nx;
+                    p.y = ny;
+                    socket.emit('playerMovement', { x: nx, y: ny });
+                }
+            }
+        }, 1000 / 60);
+
+        // === 5. 渲染循环 ===
+        function draw() {
+            requestAnimationFrame(draw);
+            
+            // 摄像机平滑跟随
+            if (gameState.players[myId]) {
+                const p = gameState.players[myId];
+                let tx = p.x + 20 - canvas.width / 2;
+                let ty = p.y + 20 - canvas.height / 2;
+                tx = Math.max(0, Math.min(tx, mapSize.w - canvas.width));
+                ty = Math.max(0, Math.min(ty, mapSize.h - canvas.height));
+                camera.x += (tx - camera.x) * 0.1;
+                camera.y += (ty - camera.y) * 0.1;
+            }
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+
+            // 画网格
+            ctx.strokeStyle = '#333'; ctx.lineWidth = 1; ctx.beginPath();
+            for(let x=0; x<mapSize.w; x+=100) { ctx.moveTo(x,0); ctx.lineTo(x,mapSize.h); }
+            for(let y=0; y<mapSize.h; y+=100) { ctx.moveTo(0,y); ctx.lineTo(mapSize.w,y); }
+            ctx.stroke();
+
+            // 画地图边界
+            ctx.strokeStyle = '#f00'; ctx.lineWidth = 5; ctx.strokeRect(0,0,mapSize.w,mapSize.h);
+
+            // 画障碍
+            ctx.fillStyle = '#555';
+            obstacles.forEach(w => {
+                ctx.fillRect(w.x, w.y, w.w, w.h);
+                ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.strokeRect(w.x, w.y, w.w, w.h);
+            });
+
+            // 画子弹
+            gameState.bullets.forEach(b => {
+                ctx.fillStyle = b.color;
+                ctx.beginPath(); ctx.arc(b.x, b.y, 5, 0, Math.PI*2); ctx.fill();
+            });
+
+            // 画玩家
+            Object.values(gameState.players).forEach(p => {
+                if (p.playerId !== myId && p.targetX !== undefined) {
+                    // 别人：插值平滑
+                    p.renderX += (p.targetX - p.renderX) * 0.15;
+                    p.renderY += (p.targetY - p.renderY) * 0.15;
+                } else {
+                    // 自己：直接显示
+                    p.renderX = p.x;
+                    p.renderY = p.y;
+                }
+
+                ctx.fillStyle = p.color;
+                ctx.fillRect(p.renderX, p.renderY, 40, 40);
+                
+                // 名字
+                ctx.fillStyle = 'white'; ctx.font = '12px Arial'; ctx.textAlign = 'center';
+                ctx.fillText(p.name, p.renderX + 20, p.renderY - 15);
+                
+                // 血条
+                ctx.fillStyle = 'red'; ctx.fillRect(p.renderX, p.renderY-10, 40, 5);
+                ctx.fillStyle = '#0f0'; ctx.fillRect(p.renderX, p.renderY-10, 40 * (p.hp/p.maxHp), 5);
+            });
+
+            ctx.restore();
+        }
+
+        function updateScoreboard() {
+            const list = Object.values(gameState.players).sort((a,b)=>b.score-a.score).slice(0,10);
+            document.getElementById('score-list').innerHTML = list.map(p => 
+                `<div style="display:flex;justify-content:space-between;color:${p.playerId===myId?'gold':'white'}">
+                    <span>${p.name}</span><span>${p.score}</span>
+                </div>`
+            ).join('');
+        }
+
+        requestAnimationFrame(draw);
+    </script>
+</body>
+</html>
